@@ -1,5 +1,6 @@
 import re
 import warnings
+from collections.abc import Callable
 from typing import Literal, cast, overload
 
 from ytmusicapi.continuations import (
@@ -116,7 +117,8 @@ class BrowsingMixin(MixinProtocol):
         body = {"browseId": "FEmusic_home"}
         response = self._send_request(endpoint, body)
         results = nav(response, SINGLE_COLUMN_TAB + SECTION_LIST)
-        home = parse_mixed_content(results)
+        home = []
+        home.extend(parse_mixed_content(results))
 
         section_list = nav(response, [*SINGLE_COLUMN_TAB, "sectionListRenderer"])
         if "continuations" in section_list:
@@ -124,13 +126,11 @@ class BrowsingMixin(MixinProtocol):
                 endpoint, body, additionalParams
             )
 
+            parse_func: Callable[[JsonList], JsonList] = lambda contents: parse_mixed_content(contents)
+
             home.extend(
                 get_continuations(
-                    section_list,
-                    "sectionListContinuation",
-                    limit - len(home),
-                    request_func,
-                    parse_mixed_content,
+                    section_list, "sectionListContinuation", limit - len(home), request_func, parse_func
                 )
             )
 
@@ -753,20 +753,125 @@ class BrowsingMixin(MixinProtocol):
             }
 
         """
-        endpoint = "player"
+        # Use next endpoint for more comprehensive metadata
+        endpoint = "next"
+        
+        # Build parameters for next endpoint
+        params = {
+            "enablePersistentPlaylistPanel": True,
+            "tunerSettingValue": "AUTOMIX_SETTING_NORMAL",
+            "videoId": videoId,
+            "params": "8gEAmgMDCNgE",
+            "playerParams": "igMDCNgE",
+            "isAudioOnly": True,
+            "responsiveSignals": {"videoInteraction": []},
+            "queueContextParams": ""
+        }
+        
+        # Send request to next endpoint
+        response = self._send_request(endpoint, params)
+        
+        # Extract song metadata from the response
+        result = {}
+        
+        # Get the current playing song info from the playlist panel
+        if "contents" in response:
+            contents = nav(response, ["contents", "singleColumnMusicWatchNextResultsRenderer", "tabbedRenderer", 
+                                     "watchNextTabbedResultsRenderer", "tabs", 0, "tabRenderer", "content", 
+                                     "musicQueueRenderer", "content", "playlistPanelRenderer", "contents"], True)
+            
+            if contents and len(contents) > 0:
+                # Find the currently playing track (selected=True)
+                current_track = None
+                for item in contents:
+                    # Check for both old and new wrapper formats
+                    if "playlistPanelVideoWrapperRenderer" in item:
+                        # New format with wrapper
+                        primary_renderer = nav(item, ["playlistPanelVideoWrapperRenderer", "primaryRenderer", "playlistPanelVideoRenderer"], True)
+                        if primary_renderer and primary_renderer.get("selected", False):
+                            current_track = primary_renderer
+                            break
+                    elif "playlistPanelVideoRenderer" in item:
+                        # Old format without wrapper
+                        renderer = item["playlistPanelVideoRenderer"]
+                        if renderer.get("selected", False):
+                            current_track = renderer
+                            break
+                
+                if current_track:
+                    # Extract detailed metadata from the current track
+                    result["videoDetails"] = {
+                        "videoId": current_track.get("videoId", videoId),
+                        "title": nav(current_track, ["title", "runs", 0, "text"], True),
+                        "author": nav(current_track, ["shortBylineText", "runs", 0, "text"], True),
+                        "channelId": nav(current_track, ["longBylineText", "runs", 0, "navigationEndpoint", 
+                                                        "browseEndpoint", "browseId"], True),
+                        "lengthSeconds": nav(current_track, ["lengthText", "runs", 0, "text"], True),
+                        "thumbnail": current_track.get("thumbnail", {}),
+                        "isExplicit": nav(current_track, ["badges", 0, "musicInlineBadgeRenderer", 
+                                                         "icon", "iconType"], True) == "MUSIC_EXPLICIT_BADGE"
+                    }
+                    
+                    # Get album info from longBylineText
+                    album_info = nav(current_track, ["longBylineText", "runs"], True)
+                    if album_info:
+                        # Parse through runs to find album info
+                        for i, run in enumerate(album_info):
+                            # Look for album browse ID (starts with MPREb_)
+                            nav_endpoint = run.get("navigationEndpoint", {})
+                            browse_endpoint = nav_endpoint.get("browseEndpoint", {})
+                            browse_id = browse_endpoint.get("browseId", "")
+                            
+                            if browse_id.startswith("MPREb_"):
+                                result["videoDetails"]["album"] = run.get("text", "")
+                                result["videoDetails"]["albumId"] = browse_id
+                                break
+                            # Sometimes album is just text without navigation
+                            elif i > 0 and run.get("text") and run["text"] not in [" • ", "•"]:
+                                # Check if this is not an artist (artist IDs usually start with UC)
+                                prev_was_artist = False
+                                if i > 0:
+                                    prev_nav = album_info[i-1].get("navigationEndpoint", {})
+                                    prev_browse = prev_nav.get("browseEndpoint", {})
+                                    if prev_browse.get("browseId", "").startswith("UC"):
+                                        prev_was_artist = True
+                                
+                                # If previous was bullet or artist, this might be album
+                                if not nav_endpoint and (prev_was_artist or (i > 0 and album_info[i-1].get("text") in [" • ", "•"])):
+                                    # Check if it's not a year (4 digits)
+                                    if not (run["text"].isdigit() and len(run["text"]) == 4):
+                                        result["videoDetails"]["album"] = run["text"]
+                                        break
+        
+        # Also call player endpoint for streaming data if needed
         if not signatureTimestamp:
             signatureTimestamp = get_datestamp() - 1
-
-        params = {
+        
+        player_params = {
             "playbackContext": {"contentPlaybackContext": {"signatureTimestamp": signatureTimestamp}},
             "video_id": videoId,
         }
-        response = self._send_request(endpoint, params)
-        keys = ["videoDetails", "playabilityStatus", "streamingData", "microformat", "playbackTracking"]
-        for k in list(response.keys()):
-            if k not in keys:
-                del response[k]
-        return response
+        player_response = self._send_request("player", player_params)
+        
+        # Merge player response data
+        if "videoDetails" not in result:
+            result["videoDetails"] = player_response.get("videoDetails", {})
+        else:
+            # Update with any missing fields from player response
+            result["videoDetails"].update({k: v for k, v in player_response.get("videoDetails", {}).items() 
+                                          if k not in result["videoDetails"]})
+        
+        # Add other important fields from player response
+        result["playabilityStatus"] = player_response.get("playabilityStatus")
+        result["streamingData"] = player_response.get("streamingData")
+        result["microformat"] = player_response.get("microformat")
+        result["playbackTracking"] = player_response.get("playbackTracking")
+        
+        # Add queue and playlist information from next response
+        if "contents" in response:
+            result["queueData"] = response.get("queueContextParams")
+        
+        return result
 
     def get_song_related(self, browseId: str) -> JsonList:
         """
@@ -847,9 +952,7 @@ class BrowsingMixin(MixinProtocol):
 
         response = self._send_request("browse", {"browseId": browseId})
         sections = nav(response, ["contents", *SECTION_LIST])
-        return parse_mixed_content(
-            sections,
-        )
+        return parse_mixed_content(sections)
 
     @overload
     def get_lyrics(self, browseId: str, timestamps: Literal[False] = False) -> Lyrics | None:
